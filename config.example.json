@@ -1,0 +1,34 @@
+{
+  "token_env": "SLACK_BOT_TOKEN",
+  "state_dir": ".agentorch",
+  "humans": ["U0XXXXXXXXX"],
+  "agents": {
+    "lead": {
+      "display_name": "Lead (Codex)",
+      "icon_emoji": ":compass:",
+      "channels": ["C0XXXXXXXX1"],
+      "coordinator": true
+    },
+    "impl": {
+      "display_name": "Implementer (Claude Code)",
+      "icon_emoji": ":hammer_and_wrench:",
+      "session_id": "",
+      "channels": ["C0XXXXXXXX2", "C0XXXXXXXX1"]
+    },
+    "reviewer": {
+      "display_name": "Reviewer (Claude Code)",
+      "icon_emoji": ":mag:",
+      "channels": ["C0XXXXXXXX3", "C0XXXXXXXX1"]
+    }
+  },
+  "limits": {
+    "mode": "shadow",
+    "pingpong_sec": 600,
+    "user_absent_pause_sec": 10800,
+    "receiver_per_hour": 6,
+    "sender_per_hour": 3,
+    "sender_per_day": 15,
+    "global_per_hour": 30,
+    "global_per_day": 120
+  }
+}

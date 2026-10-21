@@ -1,0 +1,12 @@
+agentorch.json
+.agentorch/
+*.sqlite3
+.env
+.env.*
+*.key
+*.pem
+__pycache__/
+*.egg-info/
+build/
+dist/
+.venv/
