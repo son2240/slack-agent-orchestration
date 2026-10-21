@@ -58,10 +58,16 @@ class SlackClient:
             raise SlackError(f"{method}: {data.get('error', 'unknown_error')}")
         return data
 
-    def history(self, channel: str, oldest: str | None = None, limit: int = 100) -> list[dict]:
-        """Messages newer than `oldest`, oldest first."""
-        data = self.call("conversations.history", channel=channel, oldest=oldest, limit=limit,
+    def history(self, channel: str, oldest: str | None = None, latest: str | None = None, limit: int = 100) -> list[dict]:
+        """The newest `limit` top-level messages in (oldest, latest), returned oldest first."""
+        data = self.call("conversations.history", channel=channel, oldest=oldest, latest=latest, limit=limit,
                          inclusive="false", include_all_metadata="true")
+        return sorted(data.get("messages") or [], key=lambda m: float(m.get("ts", 0)))
+
+    def replies(self, channel: str, ts: str, oldest: str | None = None, limit: int = 200) -> list[dict]:
+        """Thread messages (parent included) newer than `oldest`, oldest first."""
+        data = self.call("conversations.replies", channel=channel, ts=ts, oldest=oldest, limit=limit,
+                         include_all_metadata="true")
         return sorted(data.get("messages") or [], key=lambda m: float(m.get("ts", 0)))
 
     def post(self, **payload) -> dict:

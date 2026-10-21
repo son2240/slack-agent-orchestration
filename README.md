@@ -8,7 +8,7 @@ Coordinate AI coding agents such as **Claude Code** and **Codex** through one Sl
 
 > **한국어 요약** — Claude Code·Codex 같은 AI 코딩 에이전트 여러 개를 Slack 하나로 협업시키는 도구입니다. 기능은 네 가지입니다.
 > ① 봇 하나로 에이전트마다 다른 이름·아이콘을 써서 글을 올립니다.
-> ② 감시기가 할 일이 생겼을 때만 에이전트를 깨웁니다.
+> ② 감시기가 할 일이 생겼을 때만 에이전트를 깨웁니다. 스레드 답글, 몰린 글 빈 구간 메우기, 받은편지함 라우팅(대표 하나만 Slack을 읽음), 꺼진 감시 대신 받기, 코드가 바뀌면 다시 띄우기를 지원합니다.
 > ③ 에이전트끼리 서로 깨우는 무한 반복을 "깊이 1" 규칙과 상한·긴급 정지 스위치로 막습니다.
 > ④ SQLite 작업 대장으로 작업 소유·검토·충돌을 관리합니다.
 > 직접 설계해 매일 운영하는 개인 멀티 에이전트 환경에서 핵심 구조만 떼어 일반화했습니다. 표준 라이브러리만 쓰고, 테스트는 오프라인으로 돌아갑니다.
@@ -27,8 +27,10 @@ This project solves both with four small, independent pieces.
 | Module | What it does |
 |---|---|
 | `agentorch.post` | Posts **as a named agent** through one shared bot: per-agent name and icon, an identity check, and chain depth attached as message metadata |
-| `agentorch.watch` | A **one-shot watcher**. It polls the agent's channels, and when there is work it prints one JSON line and exits. The exit is what wakes the agent |
-| `agentorch.quiet` | A **quiet wrapper** that keeps watching inside one background task and wakes the agent only for actionable events, which saves model turns |
+| `agentorch.watch` | A **one-shot watcher**. It polls the agent's channels and threads, fills read gaps after bursts, and covers offline watchers. When there is work it prints one JSON line and exits; the exit is what wakes the agent |
+| `agentorch.inbox` | A **file inbox**: one router reads Slack, and inbox-only agents receive routed posts with no token and no API calls |
+| `agentorch.quiet` | A **quiet wrapper** that keeps watching inside one background task, wakes the agent only for actionable events, and restarts on code changes |
+| `agentorch.health` | A **read-only health table**: watcher liveness, last wake, held posts, inbox backlog, read gaps |
 | `agentorch.gate` | **Loop prevention**: the depth-1 rule, ping-pong detection, caps, a kill switch, a pause when no human is around, and shadow mode |
 | `agentorch.ledger` | A **shared task ledger** in SQLite with optimistic concurrency, provider assignment, separation of duties, file-scope locks and hash-pinned reports |
 
@@ -45,6 +47,8 @@ flowchart LR
     I -- "post.py<br/>metadata depth=1" --> S
     S -- poll --> WL
     WL -. "gate.decide: HOLD<br/>(delivered later as data)" .-> L
+    WL -- "router: atomic file copy" --> IB[(inbox/docs/*.json)]
+    IB -- "gate.decide<br/>(no Slack calls)" --> D[Docs agent<br/>inbox-only]
     L <-- create / review --> DB[(ledger.sqlite3)]
     I <-- claim / submit --> DB
 ```
@@ -84,7 +88,27 @@ agent session ──(background)── python -m agentorch quiet --as impl
                                    └─ actionable event → print 1 JSON line, exit → agent wakes, reads it, restarts the watcher
 ```
 
-`quiet` exists because every exit costs a model turn. Without it, timeouts and held posts would also wake the agent.
+`quiet` exists because every exit costs a model turn. Without it, timeouts, held posts and notices would also wake the agent. From the command line `quiet` runs each watcher round in a fresh subprocess, so when the package code changes (`code_updated`) the watcher restarts on the new code without waking anyone.
+
+### Watcher internals
+
+| Feature | How it works | Why |
+|---|---|---|
+| **Threads** | Each round reads the newest `history_window` messages. For any parent in that window whose `latest_reply` moved, it reads only the new replies (`conversations.replies`, `oldest` = last seen reply) | A human answer inside a thread still reaches the agent, and a reply is never delivered twice |
+| **Read gaps** | If every message in the window is new, the span between the cursor and the oldest message read is recorded as a gap. Each round fills gaps with at most `backfill_calls` extra `history(oldest, latest)` calls | Bursts are never silently skipped, and API usage per round stays bounded |
+| **File inbox** | A `router` agent copies posts addressed to `inbox_only` agents into `inbox/<agent>/<ts>.json`. The write is atomic: a temp file is hard-linked to the final name, so an existing name means "already delivered". Token-shaped strings are redacted, and links or junctions are refused | Slack rate-limits history reads (Tier 3 ≈ 50/min). Inbox agents add no API load and need no token. The receiver still runs the full gate |
+| **Bad or stale inbox files** | Malformed files are renamed `.bad` and reported. Records older than `inbox_max_age_sec` are held | Evidence is kept, and a late delivery cannot wake an agent with an outdated request |
+| **Offline cover** | Every round writes a heartbeat (`alive_at`). If a human addresses an agent whose watcher has been silent for longer than `liveness_sec`, the router wakes with `offline_cover` | Human requests are not lost while an agent is busy or crashed |
+| **Attachments** | Human messages carry `files: [{id, name, mimetype, size}]` only: no URLs and no content, with names cleaned | The agent can fetch a file on purpose. Nothing private leaks into logs |
+| **Notices** | "Bot is not in channel", "read backlog" and "bad inbox file" are emitted once, as non-actionable events | Operators see problems, and agents are not woken for them |
+| **Code reload** | The watcher fingerprints its own source files and exits with `code_updated` when they change | Long-lived watchers pick up fixes without manual restarts |
+
+```bash
+python -m agentorch health        # or --json
+# agent  mode    alive  alive_age_sec  last_wake  held_24h  inbox_pending  read_gaps  state_ok
+# lead   router  True   4              human      0         0              0          True
+# docs   inbox   True   2              agent      1         0              0          True
+```
 
 ### The ledger protocol
 
@@ -132,7 +156,12 @@ To pin a persona to one session, set `session_id` for the agent in the config an
 PYTHONPATH=src:tests python -m unittest discover -s tests -v
 ```
 
-All tests run offline against an in-memory Slack and a fake clock. They cover each gate rule, end-to-end `human → agent → agent` flows, the quiet wrapper and every ledger guarantee.
+All 56 tests run offline against an in-memory Slack, with threads, and a fake clock. They cover:
+- each gate rule
+- end-to-end `human → agent → agent` flows
+- thread replies, gap backfill, inbox routing (including "an inbox agent makes zero Slack calls"), offline cover, attachment sanitizing and code reload
+- the quiet wrapper
+- every ledger guarantee
 
 ## Security notes
 
@@ -142,7 +171,7 @@ All tests run offline against an in-memory Slack and a fake clock. They cover ea
 
 ## Background
 
-I designed and run a private multi-agent setup where many Claude Code and Codex sessions work in parallel and coordinate through Slack. This repository is a **clean, standalone re-implementation of its core mechanisms**: the loop gate, persona posting, quiet watching and the shared ledger. Workspace-specific wiring and operational records are left out. I designed the system; the code was written with AI coding agents (Claude Code, Codex) under my direction, which is the point of the project.
+I designed and run a private multi-agent setup where many Claude Code and Codex sessions work in parallel and coordinate through Slack. This repository is a **clean, standalone re-implementation of its core mechanisms**: the loop gate, persona posting, the watcher (threads, gap backfill, file-inbox routing, offline cover), quiet watching and the shared ledger. Workspace-specific wiring and operational records are left out. I designed the system; the code was written with AI coding agents (Claude Code, Codex) under my direction, which is the point of the project.
 
 ## License
 

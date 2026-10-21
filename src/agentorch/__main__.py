@@ -1,11 +1,11 @@
-"""Command line: python -m agentorch <post|watch|quiet|ledger> ..."""
+"""Command line: python -m agentorch <post|watch|quiet|health|ledger> ..."""
 from __future__ import annotations
 
 import argparse
 import json
 import sys
 
-from . import config, ledger, post, quiet, watch
+from . import config, health, ledger, post, quiet, state, watch
 from .slack import SlackClient, SlackError
 
 
@@ -33,6 +33,9 @@ def main(argv=None) -> int:
         w.add_argument("--interval", type=float, default=20)
         w.add_argument("--timeout" if name == "watch" else "--budget", type=float,
                        default=3600 if name == "watch" else 6900)
+
+    h = sub.add_parser("health", help="read-only status of every agent's watcher")
+    h.add_argument("--json", action="store_true")
 
     lg = sub.add_parser("ledger", help="shared task ledger")
     lg.add_argument("--db", default=".agentorch/ledger.sqlite3")
@@ -72,17 +75,27 @@ def main(argv=None) -> int:
                                      report=getattr(a, "report", None), decision=getattr(a, "decision", None)))
             return 0
         cfg = config.load(a.config)
+        if a.cmd == "health":
+            rows = health.report(cfg)
+            if a.json:
+                _emit(rows)
+            else:
+                print(health.table(rows))
+            return 0
         if a.cmd == "post" and a.dry_run:
             payload, _ = post.build_payload(cfg, a.agent, a.channel, a.text, a.thread_ts)
             _emit({"dry_run": True, "payload": payload})
             return 0
-        client = SlackClient.from_env(cfg.token_env)
+        if a.cmd == "quiet":  # each round in a fresh subprocess: picks up code changes
+            runner = quiet.subprocess_runner(a.agent, a.interval, a.config)
+            _emit(quiet.run(cfg, None, a.agent, budget=a.budget, interval=a.interval, runner=runner))
+            return 0
+        # inbox-only agents never call Slack and need no token
+        client = None if a.cmd == "watch" and cfg.agent(a.agent).inbox_only else SlackClient.from_env(cfg.token_env)
         if a.cmd == "post":
             _emit(post.post(cfg, client, a.agent, a.channel, a.text, a.thread_ts))
-        elif a.cmd == "watch":
-            _emit(watch.run(cfg, client, a.agent, timeout=a.timeout, interval=a.interval))
         else:
-            _emit(quiet.run(cfg, client, a.agent, budget=a.budget, interval=a.interval))
+            _emit(watch.run(cfg, client, a.agent, timeout=a.timeout, interval=a.interval))
         return 0
     except post.IdentityError as e:
         _emit({"ok": False, "error": "identity", "detail": str(e)})
@@ -90,7 +103,7 @@ def main(argv=None) -> int:
     except ledger.LedgerError as e:
         _emit({"ok": False, "error": e.code, "detail": str(e)})
         return 1
-    except (config.ConfigError, SlackError) as e:
+    except (config.ConfigError, SlackError, state.Unreadable) as e:
         _emit({"ok": False, "error": type(e).__name__, "detail": str(e)})
         return 2
 

@@ -31,6 +31,14 @@ DEFAULT_LIMITS = {
 }
 _INT_LIMITS = tuple(k for k in DEFAULT_LIMITS if k != "mode")
 
+DEFAULT_WATCH = {
+    "history_window": 30,         # newest N messages read per channel per round (also the thread-check window)
+    "backfill_calls": 4,          # extra history calls per round to fill read gaps after a burst
+    "liveness_sec": 180,          # a watcher silent for longer is considered offline
+    "inbox_max_age_sec": 86400,   # routed posts older than this are held, not delivered
+    "thread_keep_sec": 7 * 86400, # stop tracking thread cursors after this
+}
+
 
 class ConfigError(ValueError):
     pass
@@ -44,6 +52,8 @@ class Agent:
     session_id: str = ""              # optional: required value of AGENTORCH_SESSION_ID when posting as this agent
     channels: tuple[str, ...] = ()    # channel IDs this agent's watcher reads
     coordinator: bool = False         # coordinators accept [urgent] posts past the depth rule
+    router: bool = False              # reads Slack for inbox-only agents and covers offline watchers
+    inbox_only: bool = False          # never calls Slack: receives routed posts as files from a router
 
 
 @dataclass(frozen=True)
@@ -54,7 +64,12 @@ class Config:
     state_dir: Path
     kill_switch: Path
     token_env: str = "SLACK_BOT_TOKEN"
+    watch: dict = field(default_factory=lambda: dict(DEFAULT_WATCH))
     extra: dict = field(default_factory=dict)
+
+    @property
+    def inbox_dir(self) -> Path:
+        return self.state_dir / "inbox"
 
     def agent(self, name: str) -> Agent:
         try:
@@ -109,7 +124,11 @@ def from_dict(raw: dict, base: Path | None = None) -> Config:
             session_id=a.get("session_id", ""),
             channels=tuple(a.get("channels") or ()),
             coordinator=bool(a.get("coordinator", False)),
+            router=bool(a.get("router", False)),
+            inbox_only=bool(a.get("inbox_only", False)),
         )
+        if agents[name].inbox_only and agents[name].channels:
+            raise ConfigError(f"inbox-only agent {name!r} must not list channels")
     if not agents:
         raise ConfigError("config has no agents")
     displays = [a.display_name for a in agents.values()]
@@ -126,5 +145,15 @@ def from_dict(raw: dict, base: Path | None = None) -> Config:
         state_dir=state_dir,
         kill_switch=kill,
         token_env=raw.get("token_env") or "SLACK_BOT_TOKEN",
-        extra={k: v for k, v in raw.items() if k not in ("agents", "humans", "limits", "state_dir", "kill_switch_file", "token_env")},
+        watch=_watch_settings(raw.get("watch")),
+        extra={k: v for k, v in raw.items()
+               if k not in ("agents", "humans", "limits", "state_dir", "kill_switch_file", "token_env", "watch")},
     )
+
+
+def _watch_settings(raw: dict | None) -> dict:
+    out = dict(DEFAULT_WATCH)
+    for k, v in (raw or {}).items():
+        if k in out and isinstance(v, int) and not isinstance(v, bool) and v > 0:
+            out[k] = v
+    return out
